@@ -62,8 +62,8 @@ impl TrustConfig {
             && self.negative_weight.is_finite() && self.negative_weight >= 0.0
             && self.max_trust.is_finite() && self.max_trust > 0.0 && self.max_trust <= 1.0
             && self.decay_per_hour.is_finite() && self.decay_per_hour >= 0.0
-            && self.none_threshold.is_finite()
-            && self.trusted_threshold.is_finite()
+            && self.none_threshold.is_finite() && self.none_threshold >= 0.0 && self.none_threshold <= 1.0
+            && self.trusted_threshold.is_finite() && self.trusted_threshold >= 0.0 && self.trusted_threshold <= 1.0
     }
 }
 
@@ -98,9 +98,13 @@ impl TrustTable {
         Self { entries: Vec::new() }
     }
 
-    /// Returns the current trust score for an agent, or `-1.0` if unknown.
+    /// Returns the current trust score for an agent, or `-1.0` if unknown
+    /// or the score is non-finite (NaN / Infinity).
     pub fn score(&self, id: u16) -> f64 {
-        self.entries.iter().find(|e| e.agent_id == id).map_or(-1.0, |e| e.score)
+        self.entries
+            .iter()
+            .find(|e| e.agent_id == id)
+            .map_or(-1.0, |e| if e.score.is_finite() { e.score } else { -1.0 })
     }
 
     /// Record a positive or negative observation and apply a Bayesian-style update.
@@ -192,16 +196,18 @@ impl TrustTable {
     }
 
     /// Returns the `n` most-trusted entries sorted descending by score.
+    /// Entries with non-finite scores are excluded.
     pub fn most_trusted(&self, n: usize) -> Vec<&TrustEntry> {
-        let mut sorted: Vec<&TrustEntry> = self.entries.iter().collect();
+        let mut sorted: Vec<&TrustEntry> = self.entries.iter().filter(|e| e.score.is_finite()).collect();
         sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         sorted.truncate(n);
         sorted
     }
 
     /// Returns the `n` least-trusted entries sorted ascending by score.
+    /// Entries with non-finite scores are excluded.
     pub fn least_trusted(&self, n: usize) -> Vec<&TrustEntry> {
-        let mut sorted: Vec<&TrustEntry> = self.entries.iter().collect();
+        let mut sorted: Vec<&TrustEntry> = self.entries.iter().filter(|e| e.score.is_finite()).collect();
         sorted.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
         sorted.truncate(n);
         sorted
@@ -926,5 +932,205 @@ mod tests {
         t.revoke(1);
         t.revoke(1);
         assert_eq!(t.score(1), -1.0);
+    }
+
+    // ─── Security audit fixes ──────────────────────────────────────────
+
+    // VULN-1: score() must sanitize non-finite internal values
+    #[test]
+    fn score_returns_neg_one_for_corrupted_nan_entry() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        t.observe(1, true, &c, 100);
+        // Simulate internal corruption by injecting NaN directly into the entry
+        let e = t.entries.iter_mut().find(|e| e.agent_id == 1).unwrap();
+        e.score = f64::NAN;
+        // score() must not leak NaN to callers
+        let s = t.score(1);
+        assert_eq!(s, -1.0);
+        assert!(s.is_finite());
+    }
+
+    #[test]
+    fn score_returns_neg_one_for_corrupted_inf_entry() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        t.observe(1, true, &c, 100);
+        let e = t.entries.iter_mut().find(|e| e.agent_id == 1).unwrap();
+        e.score = f64::INFINITY;
+        let s = t.score(1);
+        assert_eq!(s, -1.0);
+        assert!(s.is_finite());
+    }
+
+    #[test]
+    fn score_returns_neg_one_for_corrupted_neg_inf_entry() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        t.observe(1, true, &c, 100);
+        let e = t.entries.iter_mut().find(|e| e.agent_id == 1).unwrap();
+        e.score = f64::NEG_INFINITY;
+        let s = t.score(1);
+        assert_eq!(s, -1.0);
+        assert!(s.is_finite());
+    }
+
+    #[test]
+    fn score_sanitized_entry_not_counted_trusted() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        // Build up enough positive observations to be trusted
+        for _ in 0..10 {
+            t.observe(1, true, &c, 100);
+        }
+        // Corrupt the score
+        t.entries.iter_mut().find(|e| e.agent_id == 1).unwrap().score = f64::NAN;
+        assert!(!t.is_trusted(1, &c));
+        assert_eq!(t.count_trusted(&c), 0);
+    }
+
+    // VULN-2: is_valid() must reject out-of-range none_threshold and trusted_threshold
+    #[test]
+    fn negative_none_threshold_is_invalid() {
+        let mut c = cfg();
+        c.none_threshold = -0.5;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn negative_trusted_threshold_is_invalid() {
+        let mut c = cfg();
+        c.trusted_threshold = -100.0;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn none_threshold_above_one_is_invalid() {
+        let mut c = cfg();
+        c.none_threshold = 1.5;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn trusted_threshold_above_one_is_invalid() {
+        let mut c = cfg();
+        c.trusted_threshold = 2.0;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn observe_with_negative_trusted_threshold_is_noop() {
+        // A config with negative trusted_threshold is now invalid, so observe is a no-op
+        let mut t = TrustTable::new();
+        let bad = TrustConfig {
+            trusted_threshold: -100.0,
+            ..cfg()
+        };
+        t.observe(1, true, &bad, 100);
+        assert_eq!(t.count(), 0);
+    }
+
+    #[test]
+    fn is_trusted_with_negative_threshold_is_false() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        for _ in 0..10 {
+            t.observe(1, true, &c, 100);
+        }
+        let bad = TrustConfig {
+            trusted_threshold: -100.0,
+            ..c
+        };
+        assert!(!t.is_trusted(1, &bad));
+    }
+
+    // VULN-3: most_trusted/least_trusted must exclude non-finite scores
+    #[test]
+    fn most_trusted_excludes_nan_entries() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        // Agent 1 has a high score
+        for _ in 0..10 {
+            t.observe(1, true, &c, 100);
+        }
+        // Agent 2 has a low score
+        t.observe(2, true, &c, 100);
+        // Corrupt agent 2's score to NaN
+        t.entries.iter_mut().find(|e| e.agent_id == 2).unwrap().score = f64::NAN;
+        // Only agent 1 should appear in results
+        let top = t.most_trusted(10);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].agent_id, 1);
+    }
+
+    #[test]
+    fn least_trusted_excludes_inf_entries() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        t.observe(1, true, &c, 100);
+        t.observe(2, true, &c, 100);
+        // Corrupt agent 2's score
+        t.entries.iter_mut().find(|e| e.agent_id == 2).unwrap().score = f64::INFINITY;
+        let bottom = t.least_trusted(10);
+        assert_eq!(bottom.len(), 1);
+        assert_eq!(bottom[0].agent_id, 1);
+    }
+
+    #[test]
+    fn most_trusted_all_nan_returns_empty() {
+        let mut t = TrustTable::new();
+        let c = cfg();
+        for id in 0..5u16 {
+            t.observe(id, true, &c, 100);
+        }
+        // Corrupt all entries
+        for e in &mut t.entries {
+            e.score = f64::NAN;
+        }
+        assert!(t.most_trusted(10).is_empty());
+        assert!(t.least_trusted(10).is_empty());
+    }
+
+    // Threshold boundary tests for VULN-2 fix
+    #[test]
+    fn none_threshold_at_zero_is_valid() {
+        let mut c = cfg();
+        c.none_threshold = 0.0;
+        assert!(c.is_valid());
+    }
+
+    #[test]
+    fn trusted_threshold_at_one_is_valid() {
+        let mut c = cfg();
+        c.trusted_threshold = 1.0;
+        assert!(c.is_valid());
+    }
+
+    #[test]
+    fn none_threshold_at_one_is_valid() {
+        let mut c = cfg();
+        c.none_threshold = 1.0;
+        assert!(c.is_valid());
+    }
+
+    #[test]
+    fn trusted_threshold_at_zero_is_valid() {
+        let mut c = cfg();
+        c.trusted_threshold = 0.0;
+        assert!(c.is_valid());
+    }
+
+    #[test]
+    fn trusted_threshold_just_above_one_is_invalid() {
+        let mut c = cfg();
+        c.trusted_threshold = 1.0 + 1e-15;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn trusted_threshold_just_below_zero_is_invalid() {
+        let mut c = cfg();
+        c.trusted_threshold = -1e-15;
+        assert!(!c.is_valid());
     }
 }
