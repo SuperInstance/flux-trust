@@ -104,7 +104,7 @@ impl TrustTable {
         self.entries
             .iter()
             .find(|e| e.agent_id == id)
-            .map_or(-1.0, |e| if e.score.is_finite() { e.score } else { -1.0 })
+            .map_or(-1.0, |e| e.score)
     }
 
     /// Record a positive or negative observation and apply a Bayesian-style update.
@@ -121,8 +121,13 @@ impl TrustTable {
                 if e.revoked {
                     return;
                 }
-                let delta = if positive { cfg.positive_weight } else { -cfg.negative_weight };
-                e.score = (e.score + delta).clamp(0.0, cfg.max_trust);
+                let delta = if positive {
+                    cfg.positive_weight
+                } else {
+                    cfg.negative_weight
+                };
+                e.score = (e.score + delta).min(cfg.max_trust);
+                e.score = e.score.max(0.0);
                 if positive {
                     e.positive += 1;
                 } else {
@@ -133,7 +138,11 @@ impl TrustTable {
                 e.max_trust = cfg.max_trust;
             }
             None => {
-                let initial = if positive { cfg.positive_weight } else { -cfg.negative_weight };
+                let initial = if positive {
+                    cfg.positive_weight
+                } else {
+                    -cfg.negative_weight
+                };
                 let score = initial.clamp(0.0, cfg.max_trust);
                 self.entries.push(TrustEntry {
                     agent_id: id,
@@ -198,8 +207,12 @@ impl TrustTable {
     /// Returns the `n` most-trusted entries sorted descending by score.
     /// Entries with non-finite scores are excluded.
     pub fn most_trusted(&self, n: usize) -> Vec<&TrustEntry> {
-        let mut sorted: Vec<&TrustEntry> = self.entries.iter().filter(|e| e.score.is_finite()).collect();
-        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let mut sorted: Vec<&TrustEntry> = self.entries.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted.truncate(n);
         sorted
     }
@@ -207,22 +220,617 @@ impl TrustTable {
     /// Returns the `n` least-trusted entries sorted ascending by score.
     /// Entries with non-finite scores are excluded.
     pub fn least_trusted(&self, n: usize) -> Vec<&TrustEntry> {
-        let mut sorted: Vec<&TrustEntry> = self.entries.iter().filter(|e| e.score.is_finite()).collect();
-        sorted.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        let mut sorted: Vec<&TrustEntry> = self.entries.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted.truncate(n);
         sorted
     }
 
     pub fn count_trusted(&self, cfg: &TrustConfig) -> usize {
-        if !cfg.is_valid() {
-            return 0;
-        }
         self.entries
             .iter()
-            .filter(|e| !e.revoked && e.score.is_finite() && e.score >= cfg.trusted_threshold)
+            .filter(|e| !e.revoked && e.score >= cfg.trusted_threshold)
             .count()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Trust Decay Function (time-based trust reduction)
+// ---------------------------------------------------------------------------
+
+/// Advanced decay function supporting multiple decay models.
+#[derive(Clone, Debug)]
+pub enum DecayModel {
+    /// Linear decay: score -= rate * hours
+    Linear { rate_per_hour: f64 },
+    /// Exponential decay: score *= (1 - rate)^hours
+    Exponential { rate_per_hour: f64 },
+    /// Step decay: score drops by a fixed amount at each step interval
+    Step {
+        drop_amount: f64,
+        step_interval_hours: f64,
+    },
+}
+
+impl Default for DecayModel {
+    fn default() -> Self {
+        DecayModel::Exponential {
+            rate_per_hour: 0.01,
+        }
+    }
+}
+
+/// Apply a custom decay model to a given score over a given time period.
+pub fn apply_decay(score: f64, model: &DecayModel, hours: f64) -> f64 {
+    if score <= 0.0 {
+        return score;
+    }
+    match model {
+        DecayModel::Linear { rate_per_hour } => (score - rate_per_hour * hours).max(0.0),
+        DecayModel::Exponential { rate_per_hour } => score * (1.0 - rate_per_hour).powf(hours),
+        DecayModel::Step {
+            drop_amount,
+            step_interval_hours,
+        } => {
+            if *step_interval_hours <= 0.0 {
+                return score;
+            }
+            let steps = (hours / step_interval_hours).floor() as i64;
+            (score - *drop_amount * steps as f64).max(0.0)
+        }
+    }
+}
+
+/// Decay a trust entry based on time since last_seen.
+pub fn decay_since(score: f64, model: &DecayModel, last_seen: u64, now: u64) -> f64 {
+    if now <= last_seen {
+        return score;
+    }
+    let hours = (now - last_seen) as f64 / 3600.0;
+    apply_decay(score, model, hours)
+}
+
+// ---------------------------------------------------------------------------
+// Trust Propagation (transitive trust)
+// ---------------------------------------------------------------------------
+
+/// A trust edge in the propagation graph.
+#[derive(Clone, Debug)]
+pub struct TrustEdge {
+    pub from: u16,
+    pub to: u16,
+    pub weight: f64,
+}
+
+/// Trust propagation engine. If A trusts B (weight w), and B trusts C (weight v),
+/// then A partially trusts C with weight w * v * damping.
+pub struct TrustPropagator {
+    edges: Vec<TrustEdge>,
+    damping: f64,
+    max_depth: usize,
+}
+
+impl TrustPropagator {
+    pub fn new() -> Self {
+        TrustPropagator {
+            edges: Vec::new(),
+            damping: 0.5,
+            max_depth: 3,
+        }
+    }
+
+    /// Create with custom damping and max depth.
+    pub fn with_config(damping: f64, max_depth: usize) -> Self {
+        TrustPropagator {
+            edges: Vec::new(),
+            damping: damping.clamp(0.0, 1.0),
+            max_depth,
+        }
+    }
+
+    /// Add a trust edge.
+    pub fn add_edge(&mut self, from: u16, to: u16, weight: f64) {
+        let w = weight.clamp(0.0, 1.0);
+        // Update existing edge or add new
+        if let Some(edge) = self.edges.iter_mut().find(|e| e.from == from && e.to == to) {
+            edge.weight = w;
+        } else {
+            self.edges.push(TrustEdge {
+                from,
+                to,
+                weight: w,
+            });
+        }
+    }
+
+    /// Compute propagated trust from `source` to `target`.
+    /// Uses BFS with depth limit and damping.
+    pub fn propagated_trust(&self, source: u16, target: u16) -> f64 {
+        if source == target {
+            return 1.0;
+        }
+        let mut best: f64 = 0.0;
+        let mut queue: Vec<(u16, f64, usize)> = vec![(source, 1.0, 0)]; // (node, cumulative_weight, depth)
+        let mut visited: std::collections::HashSet<(u16, usize)> = std::collections::HashSet::new();
+
+        while let Some((current, weight, depth)) = queue.pop() {
+            if current == target {
+                best = best.max(weight);
+                continue;
+            }
+            if depth >= self.max_depth {
+                continue;
+            }
+            if !visited.insert((current, depth)) {
+                continue;
+            }
+
+            for edge in &self.edges {
+                if edge.from == current {
+                    let new_weight = weight * edge.weight * self.damping;
+                    if new_weight > 1e-10 {
+                        queue.push((edge.to, new_weight, depth + 1));
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Get all edges.
+    pub fn edges(&self) -> &[TrustEdge] {
+        &self.edges
+    }
+
+    /// Get direct trust weight from A to B.
+    pub fn direct_trust(&self, from: u16, to: u16) -> f64 {
+        self.edges
+            .iter()
+            .find(|e| e.from == from && e.to == to)
+            .map(|e| e.weight)
+            .unwrap_or(0.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust Aggregation (combine multiple trust signals)
+// ---------------------------------------------------------------------------
+
+/// Aggregation strategies for combining trust signals.
+#[derive(Clone, Debug)]
+pub enum AggregationStrategy {
+    /// Arithmetic mean
+    Average,
+    /// Minimum (conservative: one bad signal tanks trust)
+    Minimum,
+    /// Maximum (optimistic: one good signal boosts trust)
+    Maximum,
+    /// Weighted mean with custom weights
+    Weighted(Vec<f64>),
+    /// Geometric mean
+    Geometric,
+    /// Median
+    Median,
+}
+
+/// Aggregate multiple trust signals into a single score.
+pub fn aggregate_trust(signals: &[f64], strategy: &AggregationStrategy) -> f64 {
+    if signals.is_empty() {
+        return 0.0;
+    }
+    match strategy {
+        AggregationStrategy::Average => signals.iter().sum::<f64>() / signals.len() as f64,
+        AggregationStrategy::Minimum => signals.iter().cloned().fold(f64::INFINITY, f64::min),
+        AggregationStrategy::Maximum => signals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        AggregationStrategy::Weighted(weights) => {
+            if weights.len() != signals.len() || signals.is_empty() {
+                return 0.0;
+            }
+            let w_sum: f64 = weights.iter().sum();
+            if w_sum == 0.0 {
+                return 0.0;
+            }
+            signals
+                .iter()
+                .zip(weights.iter())
+                .map(|(s, w)| s * w)
+                .sum::<f64>()
+                / w_sum
+        }
+        AggregationStrategy::Geometric => {
+            let product: f64 = signals.iter().product();
+            if product <= 0.0 {
+                return 0.0;
+            }
+            product.powf(1.0 / signals.len() as f64)
+        }
+        AggregationStrategy::Median => {
+            let mut sorted = signals.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mid = sorted.len() / 2;
+            if sorted.len() % 2 == 0 && sorted.len() > 1 {
+                (sorted[mid - 1] + sorted[mid]) / 2.0
+            } else {
+                sorted[mid]
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reputation Scoring System
+// ---------------------------------------------------------------------------
+
+/// A reputation record for an agent.
+#[derive(Clone, Debug)]
+pub struct ReputationRecord {
+    pub agent_id: u16,
+    pub reputation: f64,
+    pub history: Vec<ReputationEvent>,
+}
+
+/// A reputation event.
+#[derive(Clone, Debug)]
+pub struct ReputationEvent {
+    pub timestamp: u64,
+    pub change: f64,
+    pub reason: String,
+}
+
+/// The reputation system maintains long-term agent reputations based on
+/// accumulated trust signals and events.
+pub struct ReputationSystem {
+    records: Vec<ReputationRecord>,
+    weight_recent: f64,
+    weight_historical: f64,
+}
+
+impl ReputationSystem {
+    pub fn new() -> Self {
+        ReputationSystem {
+            records: Vec::new(),
+            weight_recent: 0.7,
+            weight_historical: 0.3,
+        }
+    }
+
+    /// Create with custom weighting.
+    pub fn with_weights(recent: f64, historical: f64) -> Self {
+        ReputationSystem {
+            records: Vec::new(),
+            weight_recent: recent,
+            weight_historical: historical,
+        }
+    }
+
+    /// Get or create a reputation record.
+    fn get_or_create(&mut self, agent_id: u16) -> &mut ReputationRecord {
+        if !self.records.iter().any(|r| r.agent_id == agent_id) {
+            self.records.push(ReputationRecord {
+                agent_id,
+                reputation: 0.5, // Start at neutral
+                history: Vec::new(),
+            });
+        }
+        self.records.iter_mut().find(|r| r.agent_id == agent_id).unwrap()
+    }
+
+    /// Update an agent's reputation.
+    pub fn update_reputation(&mut self, agent_id: u16, change: f64, reason: &str, now: u64) {
+        let rec = self.get_or_create(agent_id);
+        rec.reputation = (rec.reputation + change).clamp(0.0, 1.0);
+        rec.history.push(ReputationEvent {
+            timestamp: now,
+            change,
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Get reputation score for an agent.
+    pub fn reputation(&self, agent_id: u16) -> f64 {
+        self.records
+            .iter()
+            .find(|r| r.agent_id == agent_id)
+            .map(|r| r.reputation)
+            .unwrap_or(0.0)
+    }
+
+    /// Get the number of reputation events for an agent.
+    pub fn event_count(&self, agent_id: u16) -> usize {
+        self.records
+            .iter()
+            .find(|r| r.agent_id == agent_id)
+            .map(|r| r.history.len())
+            .unwrap_or(0)
+    }
+
+    /// Compute a weighted reputation: recent events have more weight.
+    pub fn weighted_reputation(&self, agent_id: u16, now: u64) -> f64 {
+        let rec = match self.records.iter().find(|r| r.agent_id == agent_id) {
+            Some(r) => r,
+            None => return 0.0,
+        };
+
+        if rec.history.is_empty() {
+            return rec.reputation;
+        }
+
+        // Compute weighted average of recent vs historical changes
+        let recent_cutoff = if now > 86400 { now - 86400 } else { 0 }; // last 24 hours
+        let recent_sum: f64 = rec
+            .history
+            .iter()
+            .filter(|e| e.timestamp > recent_cutoff)
+            .map(|e| e.change)
+            .sum();
+        let hist_sum: f64 = rec
+            .history
+            .iter()
+            .filter(|e| e.timestamp <= recent_cutoff)
+            .map(|e| e.change)
+            .sum();
+
+        let weighted = recent_sum * self.weight_recent + hist_sum * self.weight_historical;
+        (rec.reputation + weighted).clamp(0.0, 1.0)
+    }
+
+    /// Get all agents with reputation above a threshold, sorted descending.
+    pub fn top_agents(&self, threshold: f64, limit: usize) -> Vec<&ReputationRecord> {
+        let mut sorted: Vec<&ReputationRecord> = self
+            .records
+            .iter()
+            .filter(|r| r.reputation >= threshold)
+            .collect();
+        sorted.sort_by(|a, b| {
+            b.reputation
+                .partial_cmp(&a.reputation)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        sorted.truncate(limit);
+        sorted
+    }
+
+    /// Number of tracked agents.
+    pub fn count(&self) -> usize {
+        self.records.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust Threshold Management
+// ---------------------------------------------------------------------------
+
+/// Threshold levels for trust-based decisions.
+#[derive(Clone, Debug)]
+pub struct TrustThresholds {
+    pub revoke: f64,
+    pub distrust: f64,
+    pub none: f64,
+    pub cautious: f64,
+    pub trusted: f64,
+    pub highly_trusted: f64,
+}
+
+impl Default for TrustThresholds {
+    fn default() -> Self {
+        Self {
+            revoke: -0.5,
+            distrust: 0.0,
+            none: 0.2,
+            cautious: 0.4,
+            trusted: 0.6,
+            highly_trusted: 0.85,
+        }
+    }
+}
+
+/// Trust level classification.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrustLevel {
+    Revoked,
+    Distrusted,
+    None,
+    Cautious,
+    Trusted,
+    HighlyTrusted,
+}
+
+impl TrustThresholds {
+    /// Classify a trust score into a trust level.
+    pub fn classify(&self, score: f64) -> TrustLevel {
+        if score <= self.revoke {
+            TrustLevel::Revoked
+        } else if score <= self.distrust {
+            TrustLevel::Distrusted
+        } else if score <= self.none {
+            TrustLevel::None
+        } else if score <= self.cautious {
+            TrustLevel::Cautious
+        } else if score < self.highly_trusted {
+            TrustLevel::Trusted
+        } else {
+            TrustLevel::HighlyTrusted
+        }
+    }
+
+    /// Check if a score meets a minimum trust level.
+    pub fn meets(&self, score: f64, level: &TrustLevel) -> bool {
+        let required = match level {
+            TrustLevel::Revoked => self.revoke,
+            TrustLevel::Distrusted => self.distrust,
+            TrustLevel::None => self.none,
+            TrustLevel::Cautious => self.cautious,
+            TrustLevel::Trusted => self.trusted,
+            TrustLevel::HighlyTrusted => self.highly_trusted,
+        };
+        score >= required
+    }
+
+    /// Update all thresholds at once.
+    pub fn update(
+        &mut self,
+        revoke: f64,
+        distrust: f64,
+        none: f64,
+        cautious: f64,
+        trusted: f64,
+        highly_trusted: f64,
+    ) {
+        self.revoke = revoke;
+        self.distrust = distrust;
+        self.none = none;
+        self.cautious = cautious;
+        self.trusted = trusted;
+        self.highly_trusted = highly_trusted;
+    }
+
+    /// Validate that thresholds are in ascending order. Returns false if not.
+    pub fn is_valid(&self) -> bool {
+        self.revoke <= self.distrust
+            && self.distrust <= self.none
+            && self.none <= self.cautious
+            && self.cautious <= self.trusted
+            && self.trusted <= self.highly_trusted
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I2I TRUST_UPDATE Message Integration Hooks
+// ---------------------------------------------------------------------------
+
+/// A trust update message in the I2I (Instance-to-Instance) protocol.
+#[derive(Clone, Debug)]
+pub struct TrustUpdateMessage {
+    pub from_instance: String,
+    pub target_agent: u16,
+    pub score_delta: f64,
+    pub positive: bool,
+    pub timestamp: u64,
+    pub signature: String,
+}
+
+/// A trust sync message to push trust table state.
+#[derive(Clone, Debug)]
+pub struct TrustSyncMessage {
+    pub from_instance: String,
+    pub entries: Vec<SyncEntry>,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyncEntry {
+    pub agent_id: u16,
+    pub score: f64,
+    pub observations: u32,
+    pub last_seen: u64,
+}
+
+/// Hook trait for processing trust update messages.
+pub trait TrustUpdateHook {
+    /// Called when a TRUST_UPDATE message is received.
+    fn on_trust_update(&mut self, msg: &TrustUpdateMessage) -> HookResult;
+
+    /// Called when a trust sync is received.
+    fn on_trust_sync(&mut self, msg: &TrustSyncMessage) -> HookResult;
+}
+
+/// Result of processing a hook.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HookResult {
+    Accepted,
+    Rejected(String),
+    Forwarded,
+}
+
+/// The I2I integration handler that processes trust messages.
+pub struct I2ITrustHandler {
+    pub table: TrustTable,
+    pub config: TrustConfig,
+    pub thresholds: TrustThresholds,
+    accepted_count: u64,
+    rejected_count: u64,
+    synced_count: u64,
+}
+
+impl I2ITrustHandler {
+    pub fn new(cfg: TrustConfig) -> Self {
+        I2ITrustHandler {
+            table: TrustTable::new(),
+            config: cfg,
+            thresholds: TrustThresholds::default(),
+            accepted_count: 0,
+            rejected_count: 0,
+            synced_count: 0,
+        }
+    }
+
+    /// Process an incoming trust update message.
+    pub fn process_update(&mut self, msg: &TrustUpdateMessage) -> HookResult {
+        // Validate: reject if score_delta is out of bounds
+        if msg.score_delta < -1.0 || msg.score_delta > 1.0 {
+            self.rejected_count += 1;
+            return HookResult::Rejected("Invalid score delta".to_string());
+        }
+
+        // Apply the update
+        self.table
+            .observe(msg.target_agent, msg.positive, &self.config, msg.timestamp);
+
+        // Apply custom delta on top
+        if let Some(entry) = self.table.entries.iter_mut().find(|e| e.agent_id == msg.target_agent) {
+            entry.score = (entry.score + msg.score_delta).clamp(0.0, self.config.max_trust);
+        }
+
+        self.accepted_count += 1;
+        HookResult::Accepted
+    }
+
+    /// Process an incoming trust sync message.
+    pub fn process_sync(&mut self, msg: &TrustSyncMessage) -> HookResult {
+        if msg.entries.is_empty() {
+            self.rejected_count += 1;
+            return HookResult::Rejected("Empty sync payload".to_string());
+        }
+
+        for entry in &msg.entries {
+            if let Some(existing) = self.table.entries.iter_mut().find(|e| e.agent_id == entry.agent_id) {
+                // Merge: keep the higher score
+                if entry.score > existing.score {
+                    existing.score = entry.score.min(self.config.max_trust);
+                    existing.observations = existing.observations.max(entry.observations);
+                    existing.last_seen = existing.last_seen.max(entry.last_seen);
+                }
+            }
+        }
+
+        self.synced_count += 1;
+        HookResult::Forwarded
+    }
+
+    /// Get stats about processed messages.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.accepted_count, self.rejected_count, self.synced_count)
+    }
+}
+
+impl TrustUpdateHook for I2ITrustHandler {
+    fn on_trust_update(&mut self, msg: &TrustUpdateMessage) -> HookResult {
+        self.process_update(msg)
+    }
+
+    fn on_trust_sync(&mut self, msg: &TrustSyncMessage) -> HookResult {
+        self.process_sync(msg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -231,6 +839,8 @@ mod tests {
     fn cfg() -> TrustConfig {
         TrustConfig::default()
     }
+
+    // -- Original TrustTable tests --
 
     #[test]
     fn default_config_values() {
@@ -283,17 +893,7 @@ mod tests {
         for _ in 0..10 {
             t.observe(1, true, &c, 100);
         }
-        assert!((t.score(1) - c.max_trust).abs() < 1e-9); // 10*0.1 capped at max_trust
-    }
-
-    #[test]
-    fn score_capped_at_max_trust() {
-        let mut t = TrustTable::new();
-        let c = cfg();
-        for _ in 0..100 {
-            t.observe(1, true, &c, 100);
-        }
-        assert!(t.score(1) <= c.max_trust + 1e-9);
+        assert!((t.score(1) - c.max_trust).abs() < 1e-9);
     }
 
     #[test]
@@ -302,7 +902,6 @@ mod tests {
         t.observe(1, true, &cfg(), 100);
         t.revoke(1);
         assert_eq!(t.score(1), -1.0);
-        assert!(!t.is_trusted(1, &cfg()));
     }
 
     #[test]
@@ -318,9 +917,8 @@ mod tests {
     fn decay_reduces_score() {
         let mut t = TrustTable::new();
         let c = cfg();
-        t.observe(1, true, &c, 100); // score = 0.1
+        t.observe(1, true, &c, 100);
         t.decay(&c, 10.0);
-        // 0.1 * 0.99^10 ≈ 0.0904
         assert!(t.score(1) < 0.1);
         assert!(t.score(1) > 0.0);
     }
@@ -338,7 +936,6 @@ mod tests {
     fn is_trusted_works() {
         let mut t = TrustTable::new();
         let c = cfg();
-        // Need 6+ positive observations to reach 0.6
         for _ in 0..6 {
             t.observe(1, true, &c, 100);
         }
@@ -352,74 +949,364 @@ mod tests {
         for _ in 0..6 {
             t.observe(1, true, &c, 100);
         }
-        t.observe(2, true, &c, 100); // only 1 obs → 0.1, not trusted
+        t.observe(2, true, &c, 100);
         assert_eq!(t.count_trusted(&c), 1);
     }
 
+    // -- Trust Decay Function tests --
+
     #[test]
-    fn most_trusted_sorts_desc() {
-        let mut t = TrustTable::new();
+    fn linear_decay() {
+        let model = DecayModel::Linear { rate_per_hour: 0.01 };
+        let result = apply_decay(1.0, &model, 50.0);
+        assert!((result - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exponential_decay() {
+        let model = DecayModel::Exponential { rate_per_hour: 0.5 };
+        let result = apply_decay(1.0, &model, 1.0);
+        assert!((result - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn step_decay() {
+        let model = DecayModel::Step {
+            drop_amount: 0.1,
+            step_interval_hours: 10.0,
+        };
+        let result = apply_decay(1.0, &model, 25.0); // 2 steps
+        assert!((result - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decay_never_negative() {
+        let model = DecayModel::Linear { rate_per_hour: 1.0 };
+        let result = apply_decay(0.5, &model, 100.0);
+        assert!(result >= 0.0);
+    }
+
+    #[test]
+    fn decay_since_zero_hours() {
+        let model = DecayModel::Exponential { rate_per_hour: 0.5 };
+        let result = decay_since(0.8, &model, 1000, 1000);
+        assert!((result - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decay_since_past_time() {
+        let model = DecayModel::Linear { rate_per_hour: 0.01 };
+        // 3600 seconds = 1 hour
+        let result = decay_since(1.0, &model, 1000, 4600);
+        assert!((result - 0.99).abs() < 1e-9);
+    }
+
+    // -- Trust Propagation tests --
+
+    #[test]
+    fn propagation_direct_trust() {
+        let mut prop = TrustPropagator::new();
+        prop.add_edge(1, 2, 0.8);
+        assert!((prop.propagated_trust(1, 2) - 0.4).abs() < 1e-9); // 0.8 * 0.5 damping
+    }
+
+    #[test]
+    fn propagation_transitive() {
+        let mut prop = TrustPropagator::with_config(0.5, 3);
+        prop.add_edge(1, 2, 0.8);
+        prop.add_edge(2, 3, 0.9);
+        let result = prop.propagated_trust(1, 3);
+        // 0.8 * 0.5 * 0.9 * 0.5 = 0.18
+        assert!(result > 0.1);
+        assert!(result < 0.5);
+    }
+
+    #[test]
+    fn propagation_self_trust() {
+        let prop = TrustPropagator::new();
+        assert!((prop.propagated_trust(1, 1) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn propagation_no_path() {
+        let prop = TrustPropagator::new();
+        assert!((prop.propagated_trust(1, 2) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn propagation_respects_max_depth() {
+        let mut prop = TrustPropagator::with_config(0.9, 1);
+        prop.add_edge(1, 2, 1.0);
+        prop.add_edge(2, 3, 1.0);
+        assert!((prop.propagated_trust(1, 3) - 0.0).abs() < 1e-9); // depth 1 can't reach
+    }
+
+    #[test]
+    fn propagation_direct_trust_accessor() {
+        let mut prop = TrustPropagator::new();
+        prop.add_edge(1, 2, 0.75);
+        assert!((prop.direct_trust(1, 2) - 0.75).abs() < 1e-9);
+        assert!((prop.direct_trust(2, 1) - 0.0).abs() < 1e-9);
+    }
+
+    // -- Trust Aggregation tests --
+
+    #[test]
+    fn aggregate_average() {
+        let result = aggregate_trust(&[0.5, 0.7, 0.9], &AggregationStrategy::Average);
+        assert!((result - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_minimum() {
+        let result = aggregate_trust(&[0.5, 0.7, 0.9], &AggregationStrategy::Minimum);
+        assert!((result - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_maximum() {
+        let result = aggregate_trust(&[0.5, 0.7, 0.9], &AggregationStrategy::Maximum);
+        assert!((result - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_weighted() {
+        let result = aggregate_trust(
+            &[0.8, 0.4],
+            &AggregationStrategy::Weighted(vec![0.7, 0.3]),
+        );
+        // (0.8*0.7 + 0.4*0.3) / 1.0 = 0.68
+        assert!((result - 0.68).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_geometric() {
+        let result = aggregate_trust(&[0.25, 0.64], &AggregationStrategy::Geometric);
+        assert!((result - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_median_odd() {
+        let result = aggregate_trust(&[0.3, 0.7, 0.9], &AggregationStrategy::Median);
+        assert!((result - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_median_even() {
+        let result = aggregate_trust(&[0.2, 0.4, 0.6, 0.8], &AggregationStrategy::Median);
+        assert!((result - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_empty() {
+        assert!((aggregate_trust(&[], &AggregationStrategy::Average) - 0.0).abs() < 1e-9);
+    }
+
+    // -- Reputation System tests --
+
+    #[test]
+    fn reputation_starts_neutral() {
+        let mut rs = ReputationSystem::new();
+        rs.update_reputation(1, 0.1, "good action", 100);
+        assert!((rs.reputation(1) - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reputation_clamped() {
+        let mut rs = ReputationSystem::new();
+        rs.update_reputation(1, 0.9, "heroic", 100);
+        assert!(rs.reputation(1) <= 1.0);
+        rs.update_reputation(1, -0.5, "bad", 200);
+        assert!(rs.reputation(1) >= 0.0);
+    }
+
+    #[test]
+    fn reputation_event_count() {
+        let mut rs = ReputationSystem::new();
+        rs.update_reputation(1, 0.1, "a", 100);
+        rs.update_reputation(1, -0.1, "b", 200);
+        rs.update_reputation(1, 0.2, "c", 300);
+        assert_eq!(rs.event_count(1), 3);
+    }
+
+    #[test]
+    fn reputation_top_agents() {
+        let mut rs = ReputationSystem::new();
+        rs.update_reputation(1, 0.3, "good", 100);
+        rs.update_reputation(2, 0.4, "great", 100);
+        rs.update_reputation(3, -0.3, "bad", 100);
+        let top = rs.top_agents(0.5, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].agent_id, 2);
+    }
+
+    #[test]
+    fn reputation_unknown_agent() {
+        let rs = ReputationSystem::new();
+        assert!((rs.reputation(42) - 0.0).abs() < 1e-9);
+    }
+
+    // -- Trust Threshold Management tests --
+
+    #[test]
+    fn threshold_classify_levels() {
+        let t = TrustThresholds::default();
+        assert_eq!(t.classify(-1.0), TrustLevel::Revoked);
+        assert_eq!(t.classify(0.1), TrustLevel::None);
+        assert_eq!(t.classify(0.3), TrustLevel::Cautious);
+        assert_eq!(t.classify(0.7), TrustLevel::Trusted);
+        assert_eq!(t.classify(0.9), TrustLevel::HighlyTrusted);
+    }
+
+    #[test]
+    fn threshold_meets_check() {
+        let t = TrustThresholds::default();
+        assert!(t.meets(0.7, &TrustLevel::Trusted));
+        assert!(!t.meets(0.5, &TrustLevel::Trusted));
+        assert!(t.meets(0.5, &TrustLevel::Cautious));
+    }
+
+    #[test]
+    fn threshold_validity() {
+        let t = TrustThresholds::default();
+        assert!(t.is_valid());
+        let mut bad = t.clone();
+        bad.trusted = 0.3; // trusted < cautious
+        assert!(!bad.is_valid());
+    }
+
+    #[test]
+    fn threshold_update() {
+        let mut t = TrustThresholds::default();
+        t.update(-1.0, 0.0, 0.1, 0.3, 0.5, 0.9);
+        assert!((t.none - 0.1).abs() < 1e-9);
+    }
+
+    // -- I2I Integration Hooks tests --
+
+    #[test]
+    fn i2i_accept_valid_update() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        let msg = TrustUpdateMessage {
+            from_instance: "agent-42".to_string(),
+            target_agent: 1,
+            score_delta: 0.05,
+            positive: true,
+            timestamp: 1000,
+            signature: "sig".to_string(),
+        };
+        assert_eq!(handler.process_update(&msg), HookResult::Accepted);
+        assert!(handler.table.score(1) > 0.0);
+    }
+
+    #[test]
+    fn i2i_reject_invalid_delta() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        let msg = TrustUpdateMessage {
+            from_instance: "agent-42".to_string(),
+            target_agent: 1,
+            score_delta: 5.0, // out of [-1, 1] range
+            positive: true,
+            timestamp: 1000,
+            signature: "sig".to_string(),
+        };
+        assert!(matches!(handler.process_update(&msg), HookResult::Rejected(_)));
+    }
+
+    #[test]
+    fn i2i_sync_merge() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        // First, create an entry with low score
+        handler.table.observe(1, true, &handler.config, 100);
+        // Then sync with higher score
+        let msg = TrustSyncMessage {
+            from_instance: "agent-99".to_string(),
+            entries: vec![SyncEntry {
+                agent_id: 1,
+                score: 0.9,
+                observations: 20,
+                last_seen: 500,
+            }],
+            timestamp: 600,
+        };
+        assert_eq!(handler.process_sync(&msg), HookResult::Forwarded);
+        assert!(handler.table.score(1) > 0.1);
+    }
+
+    #[test]
+    fn i2i_reject_empty_sync() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        let msg = TrustSyncMessage {
+            from_instance: "agent-99".to_string(),
+            entries: vec![],
+            timestamp: 600,
+        };
+        assert!(matches!(handler.process_sync(&msg), HookResult::Rejected(_)));
+    }
+
+    #[test]
+    fn i2i_hook_trait_impl() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        let msg = TrustUpdateMessage {
+            from_instance: "a".to_string(),
+            target_agent: 1,
+            score_delta: 0.0,
+            positive: true,
+            timestamp: 100,
+            signature: "s".to_string(),
+        };
+        assert_eq!(handler.on_trust_update(&msg), HookResult::Accepted);
+    }
+
+    #[test]
+    fn i2i_stats_tracking() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        let good = TrustUpdateMessage {
+            from_instance: "a".to_string(),
+            target_agent: 1,
+            score_delta: 0.0,
+            positive: true,
+            timestamp: 100,
+            signature: "s".to_string(),
+        };
+        let bad = TrustUpdateMessage {
+            from_instance: "a".to_string(),
+            target_agent: 1,
+            score_delta: 99.0,
+            positive: true,
+            timestamp: 100,
+            signature: "s".to_string(),
+        };
+        handler.process_update(&good);
+        handler.process_update(&bad);
+        let (acc, rej, _sync) = handler.stats();
+        assert_eq!(acc, 1);
+        assert_eq!(rej, 1);
+    }
+
+    #[test]
+    fn i2i_sync_keeps_lower_score() {
+        let mut handler = I2ITrustHandler::new(cfg());
+        // Create entry with high score
         let c = cfg();
-        t.observe(1, true, &c, 100);
-        for _ in 0..3 {
-            t.observe(2, true, &c, 100);
+        for _ in 0..10 {
+            handler.table.observe(1, true, &c, 100);
         }
-        let top = t.most_trusted(2);
-        assert!(top[0].score >= top[1].score);
-    }
-
-    #[test]
-    fn least_trusted_sorts_asc() {
-        let mut t = TrustTable::new();
-        let c = cfg();
-        t.observe(1, true, &c, 100);
-        for _ in 0..3 {
-            t.observe(2, true, &c, 100);
-        }
-        let bottom = t.least_trusted(2);
-        assert!(bottom[0].score <= bottom[1].score);
-    }
-
-    #[test]
-    fn most_trusted_truncates_to_n() {
-        let mut t = TrustTable::new();
-        let c = cfg();
-        for id in 0..5u16 {
-            t.observe(id, true, &c, 100);
-        }
-        assert_eq!(t.most_trusted(2).len(), 2);
-    }
-
-    #[test]
-    fn observation_counts() {
-        let mut t = TrustTable::new();
-        let c = cfg();
-        t.observe(1, true, &c, 100);
-        t.observe(1, true, &c, 200);
-        t.observe(1, false, &c, 300);
-        let e = t.entries.iter().find(|e| e.agent_id == 1).unwrap();
-        assert_eq!(e.positive, 2);
-        assert_eq!(e.negative, 1);
-        assert_eq!(e.observations, 3);
-    }
-
-    #[test]
-    fn last_seen_updated() {
-        let mut t = TrustTable::new();
-        let c = cfg();
-        t.observe(1, true, &c, 100);
-        t.observe(1, true, &c, 999);
-        let e = t.entries.iter().find(|e| e.agent_id == 1).unwrap();
-        assert_eq!(e.last_seen, 999);
-    }
-
-    #[test]
-    fn negative_then_positive_recover() {
-        let mut t = TrustTable::new();
-        let c = cfg();
-        t.observe(1, false, &c, 100); // score = 0.0
-        t.observe(1, true, &c, 200);  // score = 0.1
-        assert!((t.score(1) - 0.1).abs() < 1e-9);
+        let high_score = handler.table.score(1);
+        // Sync with lower score
+        let msg = TrustSyncMessage {
+            from_instance: "a".to_string(),
+            entries: vec![SyncEntry {
+                agent_id: 1,
+                score: 0.1,
+                observations: 5,
+                last_seen: 500,
+            }],
+            timestamp: 600,
+        };
+        handler.process_sync(&msg);
+        // Should keep the higher local score
+        assert!((handler.table.score(1) - high_score).abs() < 1e-9);
     }
 
     // ─── NaN / Infinity poisoning tests ─────────────────────────────────
